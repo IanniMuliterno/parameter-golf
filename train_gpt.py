@@ -36,6 +36,29 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
+def env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean-like string, got {value!r}")
+
+
+def parse_compute_dtype(name: str) -> torch.dtype:
+    value = os.environ.get(name, "bfloat16").strip().lower()
+    if value in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if value in {"fp16", "float16", "half"}:
+        return torch.float16
+    if value in {"fp32", "float32"}:
+        return torch.float32
+    raise ValueError(f"{name} must be one of bf16/fp16/fp32, got {value!r}")
+
+
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -85,6 +108,14 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    compute_dtype = parse_compute_dtype("COMPUTE_DTYPE")
+    enable_compile = env_flag("ENABLE_COMPILE", True)
+    enable_flash_sdp = env_flag("ENABLE_FLASH_SDP", True)
+    enable_mem_efficient_sdp = env_flag("ENABLE_MEM_EFFICIENT_SDP", False)
+    enable_math_sdp = env_flag("ENABLE_MATH_SDP", False)
+    enable_fused_adam = env_flag("ENABLE_FUSED_ADAM", True)
+    enable_tf32 = env_flag("ENABLE_TF32", True)
+    muon_dtype = parse_compute_dtype("MUON_DTYPE")
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -93,11 +124,16 @@ class Hyperparameters:
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+def zeropower_via_newtonschulz5(
+    G: Tensor,
+    steps: int = 10,
+    eps: float = 1e-7,
+    compute_dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+    X = G.to(dtype=compute_dtype)
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -110,10 +146,18 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        nesterov: bool = True,
+        compute_dtype: torch.dtype = torch.bfloat16,
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, compute_dtype=compute_dtype),
         )
 
     @torch.no_grad()
@@ -135,9 +179,10 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            compute_dtype = group["compute_dtype"]
 
             total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=compute_dtype)
 
             curr = 0
             for i, p in enumerate(params):
@@ -150,7 +195,7 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps, compute_dtype=compute_dtype)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
@@ -255,7 +300,11 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(
+                device_type="cuda",
+                dtype=args.compute_dtype,
+                enabled=args.compute_dtype != torch.float32,
+            ):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -733,7 +782,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.enable_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -759,14 +809,14 @@ def main() -> None:
     master_process = rank == 0
 
     # Fast math knobs
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = args.enable_tf32
+    torch.backends.cudnn.allow_tf32 = args.enable_tf32
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_flash_sdp(args.enable_flash_sdp)
+    enable_mem_efficient_sdp(args.enable_mem_efficient_sdp)
+    enable_math_sdp(args.enable_math_sdp)
 
     logfile = None
     if master_process:
@@ -785,6 +835,17 @@ def main() -> None:
 
     log0(code, console=False)
     log0("=" * 100, console=False)
+
+    if args.compute_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            "COMPUTE_DTYPE=bfloat16 requested, but this GPU/runtime does not support CUDA bf16. "
+            "Use COMPUTE_DTYPE=float16 for older NVIDIA GPUs."
+        )
+    if args.muon_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            "MUON_DTYPE=bfloat16 requested, but this GPU/runtime does not support CUDA bf16. "
+            "Use MUON_DTYPE=float16 for older NVIDIA GPUs."
+        )
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
     log0(
@@ -835,13 +896,15 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-    ).to(device).bfloat16()
+    ).to(device=device, dtype=args.compute_dtype)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.enable_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+
+    adam_extra_kwargs = {"fused": True} if args.enable_fused_adam else {}
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -866,13 +929,14 @@ def main() -> None:
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        fused=True,
+        **adam_extra_kwargs,
     )
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        compute_dtype=args.muon_dtype,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -880,7 +944,7 @@ def main() -> None:
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        fused=True,
+        **adam_extra_kwargs,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
@@ -888,14 +952,21 @@ def main() -> None:
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
-            fused=True,
+            **adam_extra_kwargs,
         )
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(
+        f"compute_dtype:{args.compute_dtype} muon_dtype:{args.muon_dtype} "
+        f"compile:{args.enable_compile} fused_adam:{args.enable_fused_adam} tf32:{args.enable_tf32}"
+    )
+    log0(
+        f"sdp_backends:cudnn=False flash:{args.enable_flash_sdp} "
+        f"mem_efficient:{args.enable_mem_efficient_sdp} math:{args.enable_math_sdp}"
+    )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -944,7 +1015,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=args.compute_dtype, enabled=args.compute_dtype != torch.float32):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1012,7 +1083,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=args.compute_dtype, enabled=args.compute_dtype != torch.float32):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
