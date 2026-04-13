@@ -125,6 +125,10 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
+    gptq_ar_calib_num_seqs = int(os.environ.get("GPTQ_AR_CALIB_NUM_SEQS", 64))
+    gptq_ar_calib_seq_len = int(os.environ.get("GPTQ_AR_CALIB_SEQ_LEN", train_seq_len))
+    gptq_ar_calib_batch_size = int(os.environ.get("GPTQ_AR_CALIB_BATCH_SIZE", 8))
+    gptq_ar_calib_temperature = float(os.environ.get("GPTQ_AR_CALIB_TEMPERATURE", 0.8))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1256,12 +1260,22 @@ def _apply_rotation_blocks(weight: Tensor, name: str, hessian: Tensor | None, ro
     base_weight = weight.float().contiguous()
     rot = _rotation_matrix(name, block_size).to(dtype=base_weight.dtype)
     rotated = base_weight.clone()
-    rotated_h = hessian.float().clone() if hessian is not None else None
+    rotated_h = None
     for start in range(0, weight.shape[1], block_size):
         end = start + block_size
         rotated[:, start:end] = base_weight[:, start:end] @ rot
-        if rotated_h is not None:
-            rotated_h[start:end, start:end] = rot.T @ rotated_h[start:end, start:end] @ rot
+    if hessian is not None:
+        H = hessian.float().contiguous()
+        rotated_h = torch.empty_like(H)
+        # R is block diagonal, so rotate every H block pair as R_i^T H_ij R_j.
+        for row_start in range(0, weight.shape[1], block_size):
+            row_end = row_start + block_size
+            for col_start in range(0, weight.shape[1], block_size):
+                col_end = col_start + block_size
+                rotated_h[row_start:row_end, col_start:col_end] = (
+                    rot.T @ H[row_start:row_end, col_start:col_end] @ rot
+                )
+        rotated_h = ((rotated_h + rotated_h.T) * 0.5).contiguous()
     return rotated.contiguous(), rotated_h.contiguous() if rotated_h is not None else None, block_size
 
 
@@ -1297,6 +1311,7 @@ def quantize_int6_gptq(weight, hessian=None, clip_range=31, block_size=128):
         return _quantize_int6_percentile(t32, clip_range)
     rows, cols = t32.shape
     H = hessian.float().clone()
+    H = ((H + H.T) * 0.5).contiguous()
     dead = torch.diag(H) == 0
     H[dead, dead] = 1
     damp = HESSIAN_DAMPING * torch.mean(torch.diag(H)).clamp_min(1e-6)
@@ -1306,9 +1321,19 @@ def quantize_int6_gptq(weight, hessian=None, clip_range=31, block_size=128):
     W = t32[:, perm].clone()
     W[:, dead[perm]] = 0
     H = H[perm][:, perm]
-    Hinv = torch.linalg.cholesky(H)
-    Hinv = torch.cholesky_inverse(Hinv)
-    Hinv = torch.linalg.cholesky(Hinv, upper=True)
+    Hinv = None
+    eye = torch.eye(cols, dtype=H.dtype, device=H.device)
+    for retry in range(5):
+        try:
+            Htry = H if retry == 0 else H + eye * damp * (10 ** retry)
+            chol = torch.linalg.cholesky(Htry)
+            Hinv = torch.cholesky_inverse(chol)
+            Hinv = torch.linalg.cholesky(Hinv, upper=True)
+            break
+        except RuntimeError:
+            Hinv = None
+    if Hinv is None:
+        return _quantize_int6_percentile(t32, clip_range)
     best_q = None; best_scale = None; best_err = float('inf')
     for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
         if pct < 1.0:
@@ -1687,18 +1712,20 @@ def mixed_quantize_int6(
             meta[name] = {"type": "int8"}
     budget = mixed_precision_extra_budget_bytes
     selected = 0
-    for _, _, extra_bytes, name, kept in sorted(rescue_candidates, reverse=True):
-        if mixed_precision_max_tensors > 0 and selected >= mixed_precision_max_tensors:
-            continue
-        if extra_bytes > budget:
-            continue
-        result.pop(name + ".q", None)
-        result.pop(name + ".scale", None)
-        result[name] = kept
-        meta[name] = "passthrough_fp16"
-        budget -= extra_bytes
-        selected += 1
-        stats["mixed_precision_tensors"] += 1
+    if mixed_precision_max_tensors > 0 and budget > 0:
+        for _, score, extra_bytes, name, kept in sorted(rescue_candidates, reverse=True):
+            if selected >= mixed_precision_max_tensors:
+                break
+            if extra_bytes > budget:
+                continue
+            result.pop(name + ".q", None)
+            result.pop(name + ".scale", None)
+            result[name] = kept
+            meta[name] = "passthrough_fp16"
+            budget -= extra_bytes
+            selected += 1
+            stats["mixed_precision_tensors"] += 1
+            stats["quant_damage_score"] = max(0.0, float(stats["quant_damage_score"]) - float(score))
     return result, meta, stats
 def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                           template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -2262,12 +2289,21 @@ def main() -> None:
         strict=False,
     )
     # Autoregressive self-generated calibration (no external data)
-    log0("gptq:generating autoregressive calibration data (64 seqs x 2048 tokens, temp=0.8)...")
+    log0(
+        "gptq:generating autoregressive calibration data "
+        f"({args.gptq_ar_calib_num_seqs} seqs x {args.gptq_ar_calib_seq_len} tokens, "
+        f"temp={args.gptq_ar_calib_temperature})..."
+    )
     base_model.load_state_dict(export_sd, strict=False)
     t_gen = time.perf_counter()
     ar_tokens = generate_autoregressive_calib(
-        base_model, device, num_seqs=64, seq_len=args.train_seq_len,
-        vocab_size=args.vocab_size, temperature=0.8, batch_size=8, seed=args.seed,
+        base_model, device,
+        num_seqs=args.gptq_ar_calib_num_seqs,
+        seq_len=args.gptq_ar_calib_seq_len,
+        vocab_size=args.vocab_size,
+        temperature=args.gptq_ar_calib_temperature,
+        batch_size=args.gptq_ar_calib_batch_size,
+        seed=args.seed,
     )
     log0(f"gptq:generated {len(ar_tokens)} sequences in {time.perf_counter()-t_gen:.1f}s")
     log0("gptq:collecting hessians from autoregressive data...")
