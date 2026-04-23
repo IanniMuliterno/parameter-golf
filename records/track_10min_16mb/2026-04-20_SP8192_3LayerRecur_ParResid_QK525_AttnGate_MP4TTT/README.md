@@ -171,18 +171,55 @@ Recommended environment:
 - PyTorch 2.9+ CUDA 12.8-ish
 - `torchrun`
 - `sentencepiece` and `brotli` installed
-- FlashAttention 3 is recommended but not strictly required
+- FlashAttention-3 is required for priority runs, using the same `flash_attn_3` wheel path as the April 9 record
+
+### Persistent RunPod setup
+
+If you create a fresh pod each time, the only reliable way to avoid re-installing packages and re-downloading SP8192 is to attach the same RunPod persistent volume or network volume to every pod and mount it at `/workspace`.
+
+This record folder includes a bootstrap script that assumes the persistent mount is `/workspace`:
+
+```bash
+cd /workspace
+bash /workspace/parameter-golf/records/track_10min_16mb/2026-04-20_SP8192_3LayerRecur_ParResid_QK525_AttnGate_MP4TTT/runpod_bootstrap.sh
+```
+
+What it does:
+
+- clones or updates the repo under `/workspace/parameter-golf`
+- creates a reusable venv under `/workspace/.venvs/parameter-golf-cu128-torch291`
+- installs the same `flash_attn_3` wheel family used by the April 9 record
+- downloads `sp8192` only if the tokenizer or shard files are missing
+
+After the first pod, a new pod with the same mounted volume only needs:
+
+```bash
+source /workspace/.venvs/parameter-golf-cu128-torch291/bin/activate
+cd /workspace/parameter-golf/records/track_10min_16mb/2026-04-20_SP8192_3LayerRecur_ParResid_QK525_AttnGate_MP4TTT
+```
 
 Example RunPod launch:
 
 ```bash
-cd /workspace/parameter-golf/records/track_10min_16mb/2026-04-20_SP8192_3LayerRecur_ParResid_QK525_AttnGate_MP4TTT
-python3 -m pip install -r requirements.txt
+# First pod on a fresh persistent volume:
+cd /workspace
+git clone https://github.com/IanniMuliterno/parameter-golf.git
+bash /workspace/parameter-golf/records/track_10min_16mb/2026-04-20_SP8192_3LayerRecur_ParResid_QK525_AttnGate_MP4TTT/runpod_bootstrap.sh
 
+# Later pods with the same mounted volume:
+source /workspace/.venvs/parameter-golf-cu128-torch291/bin/activate
+cd /workspace/parameter-golf/records/track_10min_16mb/2026-04-20_SP8192_3LayerRecur_ParResid_QK525_AttnGate_MP4TTT
+
+# The bootstrap uses the April 9 FlashAttention-3 wheel path:
+# python -m pip install flash_attn_3 --no-deps --find-links \
+#   https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/
+
+set -o pipefail
 SEED=42 \
 RUN_ID=apr20_attngate_mp4ttt_seed42 \
 DATA_DIR=/workspace/parameter-golf/data \
 VOCAB_SIZE=8192 \
+REQUIRE_FLASH_ATTN=1 \
 QK_GAIN_INIT=5.25 \
 ATTN_OUT_GATE_ENABLED=1 \
 TTT_ENABLED=1 \
@@ -199,17 +236,19 @@ MATRIX_BITS=6 \
 EMBED_BITS=8 \
 GPTQ_CALIBRATION_BATCHES=64 \
 GPTQ_RESERVE_SECONDS=12 \
-torchrun --standalone --nproc_per_node=8 train_gpt.py
+torchrun --standalone --nproc_per_node=8 train_gpt.py 2>&1 | tee train_seed42.log
 ```
 
 For the 3-seed record test:
 
 ```bash
+set -o pipefail
 for SEED in 42 314 999; do
   RUN_ID=apr20_attngate_mp4ttt_seed${SEED} \
   SEED=${SEED} \
   DATA_DIR=/workspace/parameter-golf/data \
   VOCAB_SIZE=8192 \
+  REQUIRE_FLASH_ATTN=1 \
   QK_GAIN_INIT=5.25 \
   ATTN_OUT_GATE_ENABLED=1 \
   TTT_ENABLED=1 \
@@ -226,7 +265,7 @@ for SEED in 42 314 999; do
   EMBED_BITS=8 \
   GPTQ_CALIBRATION_BATCHES=64 \
   GPTQ_RESERVE_SECONDS=12 \
-  torchrun --standalone --nproc_per_node=8 train_gpt.py
+  torchrun --standalone --nproc_per_node=8 train_gpt.py 2>&1 | tee train_seed${SEED}.log
 done
 ```
 
@@ -260,6 +299,12 @@ done
 - `MAX_WALLCLOCK_SECONDS=600`
 - `TRAIN_BATCH_TOKENS=786432`
 - `VAL_BATCH_TOKENS=524288`
+
+### Attention backend guardrail
+
+- `REQUIRE_FLASH_ATTN=1` makes the run fail before training if FlashAttention is not importable.
+- The hyperparameter dump logs `attention_backend`; for priority runs it should be `flash_attn_interface`, `flash_attn.flash_attn_interface`, or `flash_attn`, not `torch_sdpa`.
+- If `attention_backend: torch_sdpa`, the run is using PyTorch SDPA fallback, not FlashAttention.
 
 ## Metrics to compare
 
@@ -336,6 +381,7 @@ Why I would not include it immediately:
 
 ## Files
 
+- [runpod_bootstrap.sh](/Users/ian_muliterno/Documents/GitHub/parameter-golf-fork/records/track_10min_16mb/2026-04-20_SP8192_3LayerRecur_ParResid_QK525_AttnGate_MP4TTT/runpod_bootstrap.sh)
 - [train_gpt.py](/Users/ian_muliterno/Documents/GitHub/parameter-golf-fork/records/track_10min_16mb/2026-04-20_SP8192_3LayerRecur_ParResid_QK525_AttnGate_MP4TTT/train_gpt.py)
 - [requirements.txt](/Users/ian_muliterno/Documents/GitHub/parameter-golf-fork/records/track_10min_16mb/2026-04-20_SP8192_3LayerRecur_ParResid_QK525_AttnGate_MP4TTT/requirements.txt)
 
