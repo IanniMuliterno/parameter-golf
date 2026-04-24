@@ -1,47 +1,36 @@
-"""Flash attention fallback stub for environments without flash-attn-3."""
+"""Strict FlashAttention wrapper for the April 20 LaCT record path.
+
+This folder intentionally does not provide any SDPA/math fallback. Priority and
+record runs must use the same FlashAttention installation family as the April 9
+record. If the backend is missing, fail immediately with an explicit message.
+"""
+
 from __future__ import annotations
-from contextlib import nullcontext
-import torch
-import torch.nn.functional as F
 
-try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-except Exception:
-    SDPBackend = None
-    sdpa_kernel = None
+FLASH_ATTN_INSTALL_HINT = (
+    "FlashAttention is required for this record path. Install it with the same "
+    "command used by the April 9 record:\n"
+    "pip install flash_attn_3 --no-deps --find-links "
+    "https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/"
+)
 
+_IMPORT_ERRORS: list[str] = []
+_flash_attn_func = None
 
-def _expand_gqa(q, k, v):
-    if q.size(-2) == k.size(-2):
-        return q, k, v
-    repeat = q.size(-2) // k.size(-2)
-    return q, k.repeat_interleave(repeat, dim=-2), v.repeat_interleave(repeat, dim=-2)
+for _module_name in ("flash_attn.flash_attn_interface", "flash_attn"):
+    try:
+        _module = __import__(_module_name, fromlist=["flash_attn_func"])
+        _flash_attn_func = getattr(_module, "flash_attn_func")
+        break
+    except Exception as exc:  # pragma: no cover - startup path only
+        _IMPORT_ERRORS.append(f"{_module_name}: {exc!r}")
 
-
-def _math_ctx():
-    if not torch.cuda.is_available():
-        return nullcontext()
-    if sdpa_kernel is not None and SDPBackend is not None:
-        return sdpa_kernel([SDPBackend.MATH])
-    if hasattr(torch.backends.cuda, 'sdp_kernel'):
-        try:
-            return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True, enable_cudnn=False)
-        except TypeError:
-            return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
-    return nullcontext()
+if _flash_attn_func is None:
+    details = "\n".join(_IMPORT_ERRORS) if _IMPORT_ERRORS else "no import attempts recorded"
+    raise RuntimeError(f"{FLASH_ATTN_INSTALL_HINT}\nImport errors:\n{details}")
 
 
 def flash_attn_func(q, k, v, causal=False):
-    q, k, v = _expand_gqa(q, k, v)
-    q = q.permute(0, 2, 1, 3).contiguous()
-    k = k.permute(0, 2, 1, 3).contiguous()
-    v = v.permute(0, 2, 1, 3).contiguous()
-    try:
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-    except RuntimeError as exc:
-        msg = str(exc)
-        if 'Invalid backend' not in msg and 'No available kernel' not in msg:
-            raise
-        with _math_ctx():
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-    return out.permute(0, 2, 1, 3).contiguous()
+    if not causal:
+        raise ValueError("This record path only supports causal FlashAttention")
+    return _flash_attn_func(q, k, v, causal=causal)
