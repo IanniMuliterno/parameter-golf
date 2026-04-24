@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# run.sh — 2026-04-20_SP8192_AttnGate_MultiPhaseTTT_LaCT
+# Target: 8×H100 RunPod  |  10-min train cap  |  10-min eval cap
+# Score path: quantized + multi-phase TTT (MULTIPHASE_TTT_ENABLED=1)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+# ── 1. Install dependencies ────────────────────────────────────────────────
+echo "[run.sh] Installing Python dependencies..."
+pip install --quiet --upgrade pip
+pip install --quiet -r "$SCRIPT_DIR/requirements.txt"
+
+# flash-attn 3 wheel — skip if already installed
+if ! python3 -c "import flash_attn" 2>/dev/null; then
+    echo "[run.sh] flash-attn not found; attempting wheel install..."
+    # Install from the nightly wheel index; adjust URL if your image provides it differently.
+    pip install --quiet \
+        "flash-attn>=2.6.0" \
+        --extra-index-url https://download.pytorch.org/whl/cu124 || \
+    echo "[run.sh] WARNING: flash-attn install failed; fallback stub will be used."
+fi
+
+# ── 2. Download / verify dataset ──────────────────────────────────────────
+echo "[run.sh] Fetching FineWeb SP8192 dataset (128 train shards + val + tokenizer)..."
+cd "$REPO_ROOT"
+python3 data/cached_challenge_fineweb.py --variant sp8192 --train-shards 128
+
+# ── 3. Environment / hyperparameters ──────────────────────────────────────
+# Training caps
+export MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-600}"
+export GPTQ_RESERVE_SECONDS="${GPTQ_RESERVE_SECONDS:-12}"
+
+# Reproducibility
+export SEED="${SEED:-42}"
+
+# Architecture — must match accepted baseline
+export VOCAB_SIZE=8192
+export NUM_LAYERS=11
+export MODEL_DIM=512
+export EMBEDDING_DIM=512
+export NUM_HEADS=8
+export NUM_KV_HEADS=4
+export QK_GAIN_INIT=5.25
+export NUM_LOOPS=2
+export LOOP_START=3
+export LOOP_END=5
+export ENABLE_LOOPING_AT=0.35
+export PARALLEL_RESIDUAL_START=7
+
+# New features for this record
+export ATTN_GATE_ENABLED=1          # zero-init per-channel gate on attn output
+export MULTIPHASE_TTT_ENABLED=1     # 4-phase score-first TTT (primary scored path)
+export TTT_ENABLED=0                # single-phase legacy TTT (disabled)
+export LACT_TTT_ENABLED=0           # LaCT adapter (disabled by default; enable to explore)
+
+# Multi-phase TTT boundaries
+export TTT_PHASE_A_END=0.25         # Phase A: 0–25%  (narrow params, full LR)
+export TTT_PHASE_B_END=0.65         # Phase B: 25–65% (all params, full LR)
+export TTT_PHASE_C_END=0.85         # Phase C: 65–85% (all params, 0.5× LR)
+# Phase D: 85–100%                  # (all params, 0.1× LR)
+export TTT_PHASE_C_LR_SCALE=0.5
+export TTT_PHASE_D_LR_SCALE=0.1
+
+# Entropy GPTQ allocator
+export EXPORT_ALLOCATOR=entropy
+export ARTIFACT_TARGET_BYTES=16000000
+export ALLOCATOR_ATTN_BITS="6,7"   # conservative: no 5-bit on attention
+export ALLOCATOR_MATRIX_BITS="5,6,7"
+export ALLOCATOR_EMBED_BITS="8"
+
+# Training schedule
+export ITERATIONS=20000
+export WARMDOWN_FRAC=0.72
+export TRAIN_BATCH_TOKENS=786432
+export TRAIN_LOG_EVERY=500
+export VAL_LOSS_EVERY=4000
+
+# EMA / optimiser
+export EMA_DECAY=0.9965
+export MUON_WD=0.095
+
+# ── 4. Launch ──────────────────────────────────────────────────────────────
+cd "$SCRIPT_DIR"
+echo "[run.sh] Starting torchrun with 8 GPUs..."
+echo "[run.sh] MAX_WALLCLOCK_SECONDS=$MAX_WALLCLOCK_SECONDS  SEED=$SEED"
+echo "[run.sh] ATTN_GATE_ENABLED=$ATTN_GATE_ENABLED  MULTIPHASE_TTT_ENABLED=$MULTIPHASE_TTT_ENABLED"
+
+torchrun \
+    --standalone \
+    --nproc_per_node=8 \
+    train_gpt.py
+
+echo "[run.sh] Done. Artifact: $SCRIPT_DIR/final_model.int6.ptz"
+echo "[run.sh] Logs:    $SCRIPT_DIR/logs/"
