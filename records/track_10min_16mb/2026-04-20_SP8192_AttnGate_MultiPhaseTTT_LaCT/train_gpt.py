@@ -93,11 +93,11 @@ class Hyperparameters:
 
     # ── multi-phase TTT (primary scored path) ─────────────────────────────
     multiphase_ttt_enabled      = bool(int(os.environ.get('MULTIPHASE_TTT_ENABLED', '1')))
-    ttt_phase_a_end             = float(os.environ.get('TTT_PHASE_A_END', 0.25))
-    ttt_phase_b_end             = float(os.environ.get('TTT_PHASE_B_END', 0.65))
-    ttt_phase_c_end             = float(os.environ.get('TTT_PHASE_C_END', 0.85))
-    ttt_phase_c_lr_scale        = float(os.environ.get('TTT_PHASE_C_LR_SCALE', 0.5))
-    ttt_phase_d_lr_scale        = float(os.environ.get('TTT_PHASE_D_LR_SCALE', 0.1))
+    ttt_phase_a_end             = float(os.environ.get('TTT_PHASE_A_END', 0.00))
+    ttt_phase_b_end             = float(os.environ.get('TTT_PHASE_B_END', 0.80))
+    ttt_phase_c_end             = float(os.environ.get('TTT_PHASE_C_END', 0.95))
+    ttt_phase_c_lr_scale        = float(os.environ.get('TTT_PHASE_C_LR_SCALE', 1.0))
+    ttt_phase_d_lr_scale        = float(os.environ.get('TTT_PHASE_D_LR_SCALE', 0.5))
 
     # ── LaCT fast-weight adapter (optional additional eval) ───────────────
     lact_ttt_enabled            = bool(int(os.environ.get('LACT_TTT_ENABLED', '0')))
@@ -2050,4 +2050,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

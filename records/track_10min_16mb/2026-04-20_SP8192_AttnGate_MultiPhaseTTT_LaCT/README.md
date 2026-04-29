@@ -55,8 +55,9 @@ observable impact.
 
 The gate is treated as a *control scalar* (like `mlp_scale`, `resid_mix`) for
 purposes of the multi-phase TTT Phase A, where only low-rank / scalar control
-parameters are updated. This makes Phase A extremely cheap while still giving
-the model the ability to shift per-layer attention contribution during TTT.
+parameters are updated. The code path still supports that narrow warm-up phase,
+but the current default profile disables it (`TTT_PHASE_A_END=0.00`) and goes
+straight into full-parameter adaptation.
 
 ### Multi-phase TTT (new)
 
@@ -66,27 +67,25 @@ defined over the chunk index:
 
 | Phase | Chunk range | Params updated | LR scale |
 |---|---|---|---|
-| A | 0–25% | Control scalars only (`attn_scale`, `mlp_scale`, `resid_mix`, `q_gain`, `attn_out_gate`) | 1.0× |
-| B | 25–65% | All parameters | 1.0× |
-| C | 65–85% | All parameters | 0.5× |
-| D | 85–100% | All parameters | 0.1× |
+| A | 0% | Control scalars only (`attn_scale`, `mlp_scale`, `resid_mix`, `q_gain`, `attn_out_gate`) | 1.0× |
+| B | 0–80% | All parameters | 1.0× |
+| C | 80–95% | All parameters | 1.0× |
+| D | 95–100% | All parameters | 0.5× |
 
 **Score-first invariant is preserved throughout.** Each chunk is fully scored
 under `torch.no_grad()` before the TTT update is computed. This is structurally
 identical to the April-9 legal TTT; the only difference is the update scope and
 LR schedule.
 
-The rationale for the curriculum:
+The rationale for the current default curriculum:
 
-- **Phase A** warms up the model using only its cheapest-to-move knobs. Control
-  scalars have small Hessian curvature and do not shift the representation
-  geometry significantly. This improves early-document calibration without
-  overfitting.
-- **Phase B** opens all parameters once the model has seen 25% of the
-  document and has a rough sense of its domain. Full LR exploits this signal
-  aggressively.
-- **Phase C / D** reduce LR to consolidate gains and prevent overshooting near
-  end-of-document where training signal becomes sparse.
+- **Phase A** remains available for ablations, but is disabled in the default
+  profile so the scored path starts with full-parameter updates immediately.
+- **Phase B** uses the full LR for most of the document, maximizing useful
+  adaptation time under the 10-minute budget.
+- **Phase C** keeps all parameters active but delays LR tapering until late in
+  the document.
+- **Phase D** halves the LR for the last 5% of chunks to reduce late overshoot.
 
 Total wall time is expected to be within ±5% of single-phase TTT because the
 total number of gradient steps and chunk passes is identical — only the
@@ -189,11 +188,11 @@ the record-profile values.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `TTT_PHASE_A_END` | 0.25 | Fraction of chunks ending Phase A |
-| `TTT_PHASE_B_END` | 0.65 | Fraction of chunks ending Phase B |
-| `TTT_PHASE_C_END` | 0.85 | Fraction of chunks ending Phase C |
-| `TTT_PHASE_C_LR_SCALE` | 0.5 | LR multiplier in Phase C |
-| `TTT_PHASE_D_LR_SCALE` | 0.1 | LR multiplier in Phase D |
+| `TTT_PHASE_A_END` | 0.00 | Fraction of chunks ending Phase A |
+| `TTT_PHASE_B_END` | 0.80 | Fraction of chunks ending Phase B |
+| `TTT_PHASE_C_END` | 0.95 | Fraction of chunks ending Phase C |
+| `TTT_PHASE_C_LR_SCALE` | 1.0 | LR multiplier in Phase C |
+| `TTT_PHASE_D_LR_SCALE` | 0.5 | LR multiplier in Phase D |
 | `TTT_LR` | 0.005 | Base TTT LR (cosine within each phase) |
 | `TTT_EPOCHS` | 3 | SGD steps per chunk |
 | `TTT_CHUNK_TOKENS` | 32768 | Tokens per TTT chunk |
@@ -283,11 +282,12 @@ The **primary scored path** is always `quantized_ttt_multiphase` when
 
 ## Suggested sweep order
 
-1. **Phase boundaries** — `TTT_PHASE_A_END` ∈ {0.15, 0.20, 0.25, 0.30}
-2. **Phase C/D LR scales** — grid: C ∈ {0.3, 0.5}, D ∈ {0.05, 0.1}
-3. **Attn-gate only ablation** — `ATTN_GATE_ENABLED=0` vs `1` (same seed)
-4. **LaCT state dim** — `LACT_STATE_DIM` ∈ {64, 128, 256}
-5. **LaCT scale** — `LACT_SCALE` ∈ {0.04, 0.08, 0.12}
+1. **Phase A ablation** — `TTT_PHASE_A_END` ∈ {0.00, 0.10, 0.20}
+2. **Late taper search** — `TTT_PHASE_B_END` ∈ {0.75, 0.80, 0.85}, `TTT_PHASE_C_END` ∈ {0.90, 0.95}
+3. **Phase D LR scale** — `TTT_PHASE_D_LR_SCALE` ∈ {0.3, 0.5, 0.7}
+4. **Attn-gate only ablation** — `ATTN_GATE_ENABLED=0` vs `1` (same seed)
+5. **LaCT state dim** — `LACT_STATE_DIM` ∈ {64, 128, 256}
+6. **LaCT scale** — `LACT_SCALE` ∈ {0.04, 0.08, 0.12}
 
 Run seeds 42, 314, 999 before submitting any candidate record.
 
@@ -304,8 +304,8 @@ Run seeds 42, 314, 999 before submitting any candidate record.
 | + LaCT on top (`LACT_TTT_ENABLED=1`) | ~1.073 | −0.008 |
 
 These are rough estimates. The attn gate contribution is small but reliable
-(zero-init → no risk). The multi-phase TTT gain depends on how sharp the
-domain-shift signal is in the first 25% of the document.
+(zero-init → no risk). The multi-phase TTT gain depends on how much useful
+adaptation signal can be exploited before the late taper begins.
 
 ---
 
@@ -370,6 +370,86 @@ ATTN_GATE_ENABLED=0 bash run.sh
 TTT_PHASE_A_END=0.20 TTT_PHASE_B_END=0.60 bash run.sh
 ```
 
+## RunPod `@Endpoint`
+
+The endpoint path is designed for **Serverless / `@Endpoint`** style execution,
+not manual SSH sessions. It keeps the training logic in `train_gpt.py`
+unchanged and adds only the worker wrapper and containerization needed for
+RunPod.
+
+### Files added for endpoint mode
+
+- `Dockerfile` pre-bakes Python deps, PyTorch 2.9.1 CUDA 12.8, `flash_attn_3`,
+  and the RunPod SDK.
+- `handler.py` wraps the existing `torchrun` call, streams stdout/stderr back as
+  aggregated endpoint output, and persists logs/artifacts/summaries on the
+  attached network volume.
+
+### Build
+
+Build from the repo root so the Docker context includes the whole tree:
+
+```bash
+docker build \
+  -f records/track_10min_16mb/2026-04-20_SP8192_AttnGate_MultiPhaseTTT_LaCT/Dockerfile \
+  -t parameter-golf:apr20-attngate-multiphase-lact .
+```
+
+### Endpoint configuration
+
+- GPU type: `H100 SXM`
+- GPUs per worker: `8`
+- Execution timeout: `1400` seconds
+- Network volume: attach one and mount it at RunPod's default Serverless path
+  `/runpod-volume`
+
+The handler expects the network volume and fails explicitly if it is absent. It
+stores persistent state under:
+
+- `/runpod-volume/parameter-golf/data`
+- `/runpod-volume/parameter-golf/endpoint_results/2026-04-20_SP8192_AttnGate_MultiPhaseTTT_LaCT`
+
+The first request can populate the dataset onto that volume. Later requests
+reuse it.
+
+### Request pattern
+
+With a `1400s` timeout, do **one seed per request**. The competition still
+requires seeds `42`, `314`, and `999`, so run three jobs with the same
+`run_group_id`.
+
+Example request body for seed `42`:
+
+```json
+{
+  "input": {
+    "seed": 42,
+    "run_group_id": "apr20-lact-runpod-001",
+    "prepare_dataset_if_missing": true
+  }
+}
+```
+
+Repeat that request with `seed=314` and `seed=999`. The handler includes the
+latest valid record (`2026-04-09`, TTT BPB `1.0810`) in the streamed response
+and writes a per-seed `summary.json` plus a shared `summary_index.jsonl` so
+metrics stay directly comparable against the latest valid record.
+
+### Streamed logs and saved outputs
+
+`handler.py` is a streaming handler with `return_aggregate_stream=True`, so:
+
+- `/stream` receives live log chunks as they are produced
+- `/run` and `/runsync` receive the aggregated streamed output
+
+Each job also writes:
+
+- `combined_response_log.txt` — exact handler response text you can copy to a
+  local `.txt`
+- `logs/<run_id>.txt` — training log captured from the script itself
+- `artifacts/final_model.int6.ptz` — persisted quantized artifact
+- `summary.json` — parsed metrics and deltas vs the latest valid record
+
 ### Artifact inspection
 
 After training, the compressed artifact is at `final_model.int6.ptz`. Size
@@ -392,6 +472,8 @@ The training log at `logs/<run_id>.txt` contains:
 |---|---|
 | `train_gpt.py` | Main training + eval script (2000+ lines) |
 | `flash_attn_interface.py` | Strict FlashAttention wrapper; fails explicitly if backend is missing |
+| `handler.py` | RunPod streaming endpoint wrapper around `torchrun` |
+| `Dockerfile` | RunPod worker image with pre-baked deps and FlashAttention |
 | `requirements.txt` | Python dependencies (sentencepiece, huggingface_hub, brotli) |
 | `run.sh` | End-to-end RunPod launch script |
 | `README.md` | This file |

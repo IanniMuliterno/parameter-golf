@@ -54,12 +54,12 @@ export TTT_ENABLED=0                # single-phase legacy TTT (disabled)
 export LACT_TTT_ENABLED=0           # LaCT adapter (disabled by default; enable to explore)
 
 # Multi-phase TTT boundaries
-export TTT_PHASE_A_END=0.25         # Phase A: 0–25%  (narrow params, full LR)
-export TTT_PHASE_B_END=0.65         # Phase B: 25–65% (all params, full LR)
-export TTT_PHASE_C_END=0.85         # Phase C: 65–85% (all params, 0.5× LR)
-# Phase D: 85–100%                  # (all params, 0.1× LR)
-export TTT_PHASE_C_LR_SCALE=0.5
-export TTT_PHASE_D_LR_SCALE=0.1
+export TTT_PHASE_A_END=0.00         # Phase A disabled by default in this profile
+export TTT_PHASE_B_END=0.80         # Phase B: 0–80%  (all params, full LR)
+export TTT_PHASE_C_END=0.95         # Phase C: 80–95% (all params, 1.0× LR)
+# Phase D: 95–100%                  # (all params, 0.5× LR)
+export TTT_PHASE_C_LR_SCALE=1.0
+export TTT_PHASE_D_LR_SCALE=0.5
 
 # Entropy GPTQ allocator
 export EXPORT_ALLOCATOR=entropy
