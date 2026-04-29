@@ -331,28 +331,17 @@ cd parameter-golf-fork
 # 3. Move into the record directory
 cd records/track_10min_16mb/2026-04-20_SP8192_AttnGate_MultiPhaseTTT_LaCT
 
-# 4. Install FlashAttention using the same wheel path as the April 9 record
-pip install flash_attn_3 --no-deps --find-links \
-  https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/
-
-# 5. Verify the backend is importable
-python3 -c "from flash_attn.flash_attn_interface import flash_attn_func; print('FlashAttention OK')"
-
-# 6. (Optional) set HF token if the dataset repo requires it
+# 4. (Optional) set HF token if the dataset repo requires it
 export HF_TOKEN=<your_huggingface_token>
 
-# 7. Run with default seeds
+# 5. Run with default seeds
 SEED=42  bash run.sh 2>&1 | tee logs/seed42.log
 SEED=314 bash run.sh 2>&1 | tee logs/seed314.log
 SEED=999 bash run.sh 2>&1 | tee logs/seed999.log
 
-# 8. Check final BPB lines
+# 6. Check final BPB lines
 grep "quantized_ttt_multiphase" logs/seed*.log | grep "bpb"
 ```
-
-This record path no longer falls back to SDPA. If FlashAttention is missing,
-`flash_attn_interface.py` raises an explicit error telling you to install the
-same wheel family used by the April 9 record.
 
 ### Key environment overrides
 
@@ -391,7 +380,7 @@ The training log at `logs/<run_id>.txt` contains:
 | File | Description |
 |---|---|
 | `train_gpt.py` | Main training + eval script (2000+ lines) |
-| `flash_attn_interface.py` | Strict FlashAttention wrapper; fails explicitly if backend is missing |
+| `flash_attn_interface.py` | Flash-attn fallback using `F.scaled_dot_product_attention` |
 | `requirements.txt` | Python dependencies (sentencepiece, huggingface_hub, brotli) |
 | `run.sh` | End-to-end RunPod launch script |
 | `README.md` | This file |

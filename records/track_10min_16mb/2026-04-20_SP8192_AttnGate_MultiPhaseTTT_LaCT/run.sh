@@ -12,13 +12,15 @@ echo "[run.sh] Installing Python dependencies..."
 pip install --quiet --upgrade pip
 pip install --quiet -r "$SCRIPT_DIR/requirements.txt"
 
-# flash-attn 3 wheel — must match the April 9 record path exactly
-FLASH_ATTN_WHEEL_INDEX="https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/"
-if ! python3 -c "from flash_attn.flash_attn_interface import flash_attn_func" 2>/dev/null; then
-    echo "[run.sh] FlashAttention not found; installing April 9 wheel path..."
-    python3 -m pip install --quiet flash_attn_3 --no-deps --find-links "$FLASH_ATTN_WHEEL_INDEX"
+# flash-attn 3 wheel — skip if already installed
+if ! python3 -c "import flash_attn" 2>/dev/null; then
+    echo "[run.sh] flash-attn not found; attempting wheel install..."
+    # Install from the nightly wheel index; adjust URL if your image provides it differently.
+    pip install --quiet \
+        "flash-attn>=2.6.0" \
+        --extra-index-url https://download.pytorch.org/whl/cu124 || \
+    echo "[run.sh] WARNING: flash-attn install failed; fallback stub will be used."
 fi
-python3 -c "from flash_attn.flash_attn_interface import flash_attn_func; print('[run.sh] FlashAttention backend ready.')"
 
 # ── 2. Download / verify dataset ──────────────────────────────────────────
 echo "[run.sh] Fetching FineWeb SP8192 dataset (128 train shards + val + tokenizer)..."
