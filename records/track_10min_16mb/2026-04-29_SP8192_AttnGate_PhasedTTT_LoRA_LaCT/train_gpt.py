@@ -414,21 +414,28 @@ class Rotary(nn.Module):
         self._cos_cached = None
         self._sin_cached = None
 
+    def _compute_cos_sin(self, seq_len, device):
+        rd = self.rope_dims
+        if seq_len > self.train_seq_len:
+            scale    = seq_len / self.train_seq_len
+            new_base = self.base * scale ** (rd / (rd - 2))
+            inv_freq = 1.0 / new_base ** (
+                torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd
+            )
+        else:
+            inv_freq = self.inv_freq.to(device)
+        t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)
+        return freqs.cos()[None, :, None, :], freqs.sin()[None, :, None, :]
+
     def forward(self, seq_len, device, dtype):
+        if torch._dynamo.is_compiling():
+            cos, sin = self._compute_cos_sin(seq_len, device)
+            return cos.to(dtype=dtype), sin.to(dtype=dtype)
         if (self._cos_cached is None or self._sin_cached is None
                 or self._seq_len_cached != seq_len
                 or self._cos_cached.device != device):
-            rd = self.rope_dims
-            if seq_len > self.train_seq_len:
-                scale    = seq_len / self.train_seq_len
-                new_base = self.base * scale ** (rd / (rd - 2))
-                inv_freq = 1.0 / new_base ** (torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd)
-            else:
-                inv_freq = self.inv_freq.to(device)
-            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
-            freqs = torch.outer(t, inv_freq)
-            self._cos_cached    = freqs.cos()[None, :, None, :]
-            self._sin_cached    = freqs.sin()[None, :, None, :]
+            self._cos_cached, self._sin_cached = self._compute_cos_sin(seq_len, device)
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
@@ -2653,6 +2660,7 @@ def train_and_eval(h, device):
 
 
 def main():
+    torch._dynamo.config.allow_unspec_int_on_nn_module = True
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
