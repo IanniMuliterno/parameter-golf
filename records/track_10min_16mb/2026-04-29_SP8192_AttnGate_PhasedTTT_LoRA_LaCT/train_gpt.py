@@ -163,23 +163,8 @@ class Hyperparameters:
     lqer_asym_enabled           = bool(int(os.environ.get('LQER_ASYM_ENABLED', '1')))
     lqer_asym_group             = int(os.environ.get('LQER_ASYM_GROUP', '64'))
 
-    # ── entropy allocator ─────────────────────────────────────────────────
-    export_allocator            = os.environ.get('EXPORT_ALLOCATOR', 'mixed').lower()
+    # ── export size budget ────────────────────────────────────────────────
     artifact_target_bytes       = int(os.environ.get('ARTIFACT_TARGET_BYTES', 16000000))
-    allocator_group_cols        = int(os.environ.get('ALLOCATOR_GROUP_COLS', 128))
-    allocator_matrix_bits       = tuple(int(x) for x in os.environ.get('ALLOCATOR_MATRIX_BITS', '5,6,7').split(',') if x)
-    # mlp falls back to matrix_bits; attn is conservative (no 5-bit)
-    allocator_mlp_bits          = tuple(int(x) for x in os.environ.get('ALLOCATOR_MLP_BITS', '').split(',') if x) or None
-    allocator_attn_bits         = tuple(int(x) for x in os.environ.get('ALLOCATOR_ATTN_BITS', '6,7').split(',') if x) or None
-    # embeddings: conservative 8-bit only
-    allocator_embed_bits        = tuple(int(x) for x in os.environ.get('ALLOCATOR_EMBED_BITS', '8').split(',') if x)
-    allocator_matrix_sigmas     = tuple(float(x) for x in os.environ.get('ALLOCATOR_MATRIX_SIGMAS', '10.5,12.85,15.0').split(',') if x)
-    allocator_mlp_sigmas        = tuple(float(x) for x in os.environ.get('ALLOCATOR_MLP_SIGMAS', '').split(',') if x) or None
-    allocator_attn_sigmas       = tuple(float(x) for x in os.environ.get('ALLOCATOR_ATTN_SIGMAS', '').split(',') if x) or None
-    allocator_embed_sigmas      = tuple(float(x) for x in os.environ.get('ALLOCATOR_EMBED_SIGMAS', '16.0,20.0,24.0').split(',') if x)
-    allocator_use_entropy_proxy = bool(int(os.environ.get('ALLOCATOR_USE_ENTROPY_PROXY', '1')))
-    allocator_lambdas           = tuple(float(x) for x in os.environ.get('ALLOCATOR_LAMBDAS', '0,1e-9,3e-9,1e-8,3e-8,1e-7,3e-7,1e-6,3e-6,1e-5').split(',') if x)
-    allocator_code_wrappers     = tuple(x for x in os.environ.get('ALLOCATOR_CODE_WRAPPERS', 'source,lzma_raw_b85_exec').split(',') if x)
 
     # ── distributed ───────────────────────────────────────────────────────
     distributed     = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
@@ -1103,115 +1088,6 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
     return Q[:, invperm], s
 
 
-# ── entropy-constrained group allocator ──────────────────────────────────────
-
-def _code_wrapper_sizes(code, h):
-    sizes = {}
-    if 'source' in h.allocator_code_wrappers:
-        sizes['source'] = len(code.encode('utf-8'))
-    if 'lzma_raw_b85_exec' in h.allocator_code_wrappers:
-        import base64
-        payload = lzma.compress(code.encode('utf-8'),
-                                format=lzma.FORMAT_RAW,
-                                filters=[{'id': lzma.FILTER_LZMA2}])
-        wrapped = (
-            "import lzma as L,base64 as B\n"
-            "exec(L.decompress(B.b85decode("
-            + repr(base64.b85encode(payload).decode('ascii'))
-            + "),format=L.FORMAT_RAW,filters=[{'id':L.FILTER_LZMA2}]))"
-        )
-        sizes['lzma_raw_b85_exec'] = len(wrapped.encode('utf-8'))
-    if not sizes:
-        sizes['source'] = len(code.encode('utf-8'))
-    return sizes
-
-
-def _write_tsv(path, rows):
-    if not rows:
-        return
-    keys = list(rows[0].keys())
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write('\t'.join(keys) + '\n')
-        for row in rows:
-            f.write('\t'.join(str(row.get(k, '')) for k in keys) + '\n')
-
-
-def _group_trace(H, c1, c2):
-    if H is None:
-        return 1.0
-    d = H.diag().float()[c1:c2]
-    return float(d.mean().clamp_min(1e-12).item())
-
-
-def _group_error(W, W_hat, H, c1, c2):
-    return _group_trace(H, c1, c2) * float((W.float() - W_hat.float()).pow(2).mean().item())
-
-
-def _dequant_group(q, s):
-    return q.float() * s.float().view(q.shape[0], 1)
-
-
-def _entropy_proxy_bytes(q_int8):
-    flat   = q_int8.reshape(-1).numpy().astype(np.int16) + 128
-    counts = np.bincount(flat, minlength=256).astype(np.float64)
-    counts = counts[counts > 0]
-    n      = counts.sum()
-    probs  = counts / n
-    bits_per_sym = -float((probs * np.log2(probs)).sum())
-    return float(bits_per_sym * n / 8.0) + 16.0 * q_int8.shape[0]
-
-
-def _allocator_bits_for_name(name, h):
-    if 'tok_emb' in name:
-        return h.allocator_embed_bits
-    cat = classify_param(name)
-    if cat == 'mlp'  and h.allocator_mlp_bits  is not None:
-        return h.allocator_mlp_bits
-    if cat == 'attn' and h.allocator_attn_bits is not None:
-        return h.allocator_attn_bits
-    return h.allocator_matrix_bits
-
-
-def _allocator_sigmas_for_name(name, h):
-    if 'tok_emb' in name:
-        return h.allocator_embed_sigmas
-    cat = classify_param(name)
-    if cat == 'mlp'  and h.allocator_mlp_sigmas  is not None:
-        return h.allocator_mlp_sigmas
-    if cat == 'attn' and h.allocator_attn_sigmas is not None:
-        return h.allocator_attn_sigmas
-    return h.allocator_matrix_sigmas
-
-
-def _precompute_group_options(name, t, H, h):
-    W          = t.detach().cpu().float().contiguous()
-    rows, cols = W.shape
-    group_cols = max(1, h.allocator_group_cols)
-    groups     = []
-    for c1 in range(0, cols, group_cols):
-        c2  = min(c1 + group_cols, cols)
-        Wg  = W[:, c1:c2].contiguous()
-        Hg  = H[c1:c2, c1:c2].contiguous() if H is not None else torch.eye(c2 - c1)
-        opts = []
-        for bits in _allocator_bits_for_name(name, h):
-            clip_range = 2 ** (bits - 1) - 1
-            for sigma in _allocator_sigmas_for_name(name, h):
-                q, s    = gptq_quantize_weight(Wg, Hg, clip_sigmas=sigma,
-                                               clip_range=clip_range,
-                                               block_size=min(128, c2 - c1))
-                recon   = _dequant_group(q, s)
-                err     = _group_error(Wg, recon, H, c1, c2)
-                proxy_bits = (_entropy_proxy_bytes(q) * 8.0
-                              if h.allocator_use_entropy_proxy
-                              else float(bits * Wg.numel() + 16 * rows))
-                opts.append({'bits': int(bits), 'sigma': float(sigma),
-                             'q': q.contiguous(), 'scale': s.contiguous(),
-                             'error': err, 'proxy_bits': proxy_bits})
-        opts.sort(key=lambda x: (x['error'], x['proxy_bits']))
-        groups.append(opts)
-    return {'name': name, 'shape': tuple(W.shape), 'groups': groups, 'group_cols': group_cols}
-
-
 def _quantize_gate_int8_row(w):
     """Symmetric int8-per-row quantization for small gate tensors (QuantGate)."""
     W = w.float().contiguous()
@@ -1240,124 +1116,6 @@ def _lqer_pack_asym(A, B, g=64):
         torch.int8
     ).reshape(B.shape)
     return qA, sA, qB, sB
-
-
-def _build_allocator_obj(state_dict, large_entries, selection, h):
-    result = {}
-    meta   = {}
-    score  = 0.0
-    proxy_bits = 0.0
-    counts = collections.Counter()
-    for name, tensor in state_dict.items():
-        t = tensor.detach().cpu().contiguous()
-        if name not in large_entries:
-            if (h.gated_attn_quant_gate and t.is_floating_point() and t.ndim == 2
-                    and name.endswith('.attn_gate_w') and 1024 <= t.numel() <= 8192):
-                gq, gs = _quantize_gate_int8_row(t)
-                result[name + '.gq'] = gq
-                result[name + '.gs'] = gs
-                meta[name] = 'gate_int8_row'
-            else:
-                result[name] = t.to(torch.float16) if t.is_floating_point() else t
-                meta[name]   = 'passthrough (float16)'
-            continue
-        entry      = large_entries[name]
-        rows, cols = entry['shape']
-        q_full     = torch.empty((rows, cols), dtype=torch.int8)
-        scale_full = torch.empty((rows, len(entry['groups'])), dtype=torch.float16)
-        bits_list  = []
-        sigmas_list = []
-        for gi, opts in enumerate(entry['groups']):
-            opt = opts[selection[name][gi]]
-            c1  = gi * entry['group_cols']
-            c2  = min(c1 + entry['group_cols'], cols)
-            q_full[:, c1:c2] = opt['q']
-            scale_full[:, gi] = opt['scale']
-            bits_list.append(opt['bits'])
-            sigmas_list.append(round(opt['sigma'], 6))
-            score      += opt['error']
-            proxy_bits += opt['proxy_bits']
-            counts[f"int{opt['bits']}"] += c2 - c1
-        result[name + '.q']    = q_full.contiguous()
-        result[name + '.scale'] = scale_full.contiguous()
-        meta[name] = {'format': 'group_gptq_v1', 'group_cols': entry['group_cols'],
-                      'bits': bits_list, 'sigmas': sigmas_list}
-    return ({'w': result, 'm': meta,
-             'allocator': {'format': 'entropy_constrained_group_gptq_v1',
-                           'score': score, 'proxy_bits': proxy_bits,
-                           'bit_columns': dict(counts)}},
-            score, proxy_bits, dict(counts))
-
-
-def _selection_for_lambda(large_entries, lam):
-    selection = {}
-    for name, entry in large_entries.items():
-        selection[name] = [
-            min(range(len(opts)), key=lambda i: opts[i]['error'] + lam * opts[i]['proxy_bits'])
-            for opts in entry['groups']
-        ]
-    return selection
-
-
-def gptq_entropy_allocator_quantize(state_dict, hessians, h, code):
-    large_entries = {}
-    for name, tensor in state_dict.items():
-        t = tensor.detach().cpu().contiguous()
-        if not t.is_floating_point() or t.ndim != 2 or t.numel() <= 65536:
-            continue
-        if name not in hessians:
-            log(f'allocator:missing_hessian name:{name} fallback_passthrough')
-            continue
-        log(f'allocator:precompute name:{name} shape:{tuple(t.shape)} '
-            f'groups:{math.ceil(t.shape[1] / max(1, h.allocator_group_cols))}')
-        large_entries[name] = _precompute_group_options(name, t, hessians[name], h)
-    code_sizes = _code_wrapper_sizes(code, h)
-    rows  = []
-    best  = None
-    seen  = set()
-    for wrapper, code_bytes in sorted(code_sizes.items(), key=lambda kv: kv[1]):
-        for lam in h.allocator_lambdas:
-            selection = _selection_for_lambda(large_entries, lam)
-            key = (wrapper, tuple((n, tuple(v)) for n, v in sorted(selection.items())))
-            if key in seen:
-                continue
-            seen.add(key)
-            obj, score, pb, counts = _build_allocator_obj(state_dict, large_entries, selection, h)
-            buf   = io.BytesIO()
-            torch.save(obj, buf)
-            raw   = buf.getvalue()
-            blob  = _compress(raw, h.compressor)
-            model_bytes = len(blob)
-            total_bytes = model_bytes + code_bytes
-            row = {'lambda': lam, 'wrapper': wrapper,
-                   'code_bytes': code_bytes, 'model_bytes': model_bytes,
-                   'total_bytes': total_bytes, 'score': f'{score:.9e}',
-                   'proxy_bits': f'{pb:.0f}',
-                   'bit_columns': ','.join(f'{k}:{v}' for k, v in sorted(counts.items()))}
-            rows.append(row)
-            valid = total_bytes <= h.artifact_target_bytes
-            if (best is None
-                    or (valid and (best[0] > h.artifact_target_bytes or score < best[1]))
-                    or (best[0] > h.artifact_target_bytes and total_bytes < best[0])):
-                best = (total_bytes, score, model_bytes, code_bytes, wrapper, lam, obj, raw, blob, row)
-    if h.is_main_process:
-        os.makedirs('logs', exist_ok=True)
-        _write_tsv('logs/allocator_candidates.tsv', rows)
-        log(f'allocator_candidates:logs/allocator_candidates.tsv candidates:{len(rows)}')
-    if best is None:
-        raise RuntimeError('allocator produced no candidates')
-    total_bytes, score, model_bytes, code_bytes, wrapper, lam, obj, raw, blob, row = best
-    obj['allocator'].update({
-        'selected_lambda': lam, 'selected_wrapper': wrapper,
-        'selected_code_bytes': code_bytes, 'selected_model_bytes': model_bytes,
-        'selected_total_bytes': total_bytes, 'target_total_bytes': h.artifact_target_bytes,
-    })
-    log(f'allocator_selected lambda:{lam:g} wrapper:{wrapper} score:{score:.9e} '
-        f'model_bytes:{model_bytes} code_bytes:{code_bytes} '
-        f'total_bytes:{total_bytes} target_bytes:{h.artifact_target_bytes}')
-    return obj, {'compressed_bytes': model_bytes, 'raw_bytes': len(raw),
-                 'total_bytes': total_bytes, 'code_bytes': code_bytes,
-                 'wrapper': wrapper, 'score': score, 'blob': blob}
 
 
 def gptq_mixed_quantize_legacy(state_dict, hessians, h):
@@ -1562,22 +1320,18 @@ def serialize(h, base_model, code):
     hessians     = collect_hessians(base_model, calib_loader, h, device,
                                     n_calibration_batches=h.gptq_calibration_batches)
     log(f'GPTQ:collected {len(hessians)} Hessians in {time.perf_counter() - t0:.1f}s')
-    if h.export_allocator == 'entropy':
-        quant_obj, quant_stats = gptq_entropy_allocator_quantize(sd_cpu, hessians, h, code)
-        quant_blob      = quant_stats['blob']
-        quant_file_bytes = quant_stats['compressed_bytes']
-        bytes_total     = quant_stats['total_bytes']
-        code_bytes      = quant_stats['code_bytes']
-        quant_raw_bytes = quant_stats['raw_bytes']
-    else:
-        quant_result, quant_meta = gptq_mixed_quantize_legacy(sd_cpu, hessians, h)
-        quant_buf  = io.BytesIO()
-        torch.save({'w': quant_result, 'm': quant_meta}, quant_buf)
-        quant_raw  = quant_buf.getvalue()
-        quant_blob = _compress(quant_raw, h.compressor)
-        quant_file_bytes = len(quant_blob)
-        bytes_total     = quant_file_bytes + code_bytes
-        quant_raw_bytes = len(quant_raw)
+    quant_result, quant_meta = gptq_mixed_quantize_legacy(sd_cpu, hessians, h)
+    quant_buf  = io.BytesIO()
+    torch.save({'w': quant_result, 'm': quant_meta}, quant_buf)
+    quant_raw  = quant_buf.getvalue()
+    quant_blob = _compress(quant_raw, h.compressor)
+    quant_file_bytes = len(quant_blob)
+    bytes_total     = quant_file_bytes + code_bytes
+    quant_raw_bytes = len(quant_raw)
+    if bytes_total > h.artifact_target_bytes:
+        raise RuntimeError(
+            f'Quantized artifact exceeds budget: total_bytes={bytes_total} '
+            f'target_bytes={h.artifact_target_bytes}')
     if h.is_main_process:
         with open(h.quantized_model_path, 'wb') as f:
             f.write(quant_blob)

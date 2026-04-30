@@ -59,7 +59,7 @@ Inside each batch, temporary LoRA adapters are still used as the local score-fir
 
 ### Mixed GPTQ + LQER
 
-The export path defaults to `EXPORT_ALLOCATOR=mixed` and includes the exact LQER factor-packing path taken from PR `#1855`:
+The export path is the mixed GPTQ + LQER path from PR `#1855`:
 
 - `MLP_CLIP_SIGMAS=12.0`
 - `ATTN_CLIP_SIGMAS=13.0`
@@ -165,7 +165,6 @@ These are the record defaults currently wired into `train_gpt.py`, `run.sh`, and
 
 | Variable | Default |
 |---|---|
-| `EXPORT_ALLOCATOR` | `mixed` |
 | `ARTIFACT_TARGET_BYTES` | `16000000` |
 | `MATRIX_BITS` | `6` |
 | `EMBED_BITS` | `8` |
@@ -289,7 +288,6 @@ MAX_WALLCLOCK_SECONDS=180 \
 GPTQ_RESERVE_SECONDS=20 \
 ITERATIONS=20 \
 EMA_DECAY=0.0 \
-EXPORT_ALLOCATOR=entropy \
 TRAIN_BATCH_TOKENS=131072 \
 VAL_BATCH_TOKENS=131072 \
 TRAIN_LOG_EVERY=5 \
@@ -309,7 +307,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee smoke_1xh100.lo
 Notes:
 
 - `EMA_DECAY=0.0` avoids misleading post-EMA degradation on a very short smoke run.
-- `EXPORT_ALLOCATOR=entropy` makes the exporter search for a candidate that respects the `16 MB` budget.
+- The export path is fixed to mixed GPTQ + LQER. If the packed artifact exceeds `ARTIFACT_TARGET_BYTES`, the run fails explicitly.
 - This smoke run is for codepath validation only. It is not representative of the final competition metric.
 
 ### Full manual 8×H100 run
